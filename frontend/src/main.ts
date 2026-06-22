@@ -40,6 +40,18 @@ interface UIState {
   selectedId: string | null;     // peer hex ID of the open conversation
   history: Map<string, node.Message[]>; // peer hex ID → msgs
   aliases: Map<string, string>;  // peer hex ID → alias name
+  // nearBottom reflects whether the messages panel is
+  // currently scrolled within ~60px of the bottom. We
+  // update it on every scroll event and read it after
+  // appending a new message to decide whether to
+  // stick to the bottom (chat-style auto-scroll) or
+  // leave the user where they are (so they can read
+  // history without being yanked around).
+  nearBottom: boolean;
+  // peers we've already auto-aliased from their
+  // hostname. Avoids spamming SetAlias on every
+  // peer:event when nothing changed.
+  autoAliased: Set<string>;
 }
 
 const state: UIState = {
@@ -49,6 +61,8 @@ const state: UIState = {
   selectedId: null,
   history: new Map(),
   aliases: new Map(),
+  nearBottom: true,
+  autoAliased: new Set(),
 };
 
 // ----- DOM injection (one-shot at startup) -----
@@ -214,6 +228,10 @@ function renderChatHeader() {
 
 function renderMessages() {
   const el = document.getElementById('messages')!;
+  // Capture pre-render position so we can decide after
+  // the innerHTML swap whether to stick to the bottom
+  // or stay where the user has scrolled to.
+  const wasNearBottom = isNearBottom(el);
   if (!state.selectedId) {
     el.innerHTML = `<div class="empty">
       <div class="em-title">no peer selected</div>
@@ -249,7 +267,24 @@ function renderMessages() {
       <div class="msg-time">${fmtTime(m.Timestamp)}</div>
     </div>`;
   }).join('');
-  el.scrollTop = el.scrollHeight;
+  // Smart auto-scroll: only pin to bottom if the user
+  // was already near the bottom when the render started.
+  // Otherwise leave them where they are so reading
+  // history doesn't get yanked around.
+  if (wasNearBottom) {
+    el.scrollTop = el.scrollHeight;
+  }
+  // Refresh the tracked position so subsequent renders
+  // (e.g. live incoming messages) make the right call.
+  state.nearBottom = isNearBottom(el);
+}
+
+// isNearBottom reports whether `el` is within ~60px of
+// its scroll bottom. Used by renderMessages for
+// "stick-to-bottom-or-not" decisions and by the scroll
+// listener to keep state.nearBottom up to date.
+function isNearBottom(el: HTMLElement): boolean {
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) < 60;
 }
 
 function escapeHtml(s: string): string {
@@ -312,6 +347,34 @@ async function promptAlias(peerRef: string) {
     if (r) toast(`set alias: ${r}`);
   }
   await refreshAll();
+}
+
+// maybeAutoAlias promotes a peer's hostname into a
+// persistent alias the first time we learn it.
+//
+// Why: ListPeers() returns Name (alias) or Hostname
+// (gossip'd via M5 roster sync). Until the first roster
+// sync envelope lands after channel-ready, Hostname
+// can be empty and the peer shows up as "peer bef56954".
+// Once Hostname arrives we persist it as the alias so
+// the friendly name survives restarts. Subsequent calls
+// are no-ops (we track autoAliased to avoid spamming
+// SetAlias on every peer:event).
+async function maybeAutoAlias() {
+  for (const p of state.peers) {
+    if (p.IsSelf) continue;
+    if (p.Name) continue;             // user (or we) already set an alias
+    if (!p.Hostname) continue;         // no hostname yet — wait for gossip
+    if (state.autoAliased.has(p.PeerID)) continue;
+    state.autoAliased.add(p.PeerID);
+    const r = await SetAlias(p.PeerID, p.Hostname);
+    if (r) {
+      // Roll back the marker so we retry next time.
+      state.autoAliased.delete(p.PeerID);
+      // Don't toast every retry — quietly retry on next
+      // peer:event is friendlier than spamming the user.
+    }
+  }
 }
 
 async function promptDial() {
@@ -377,12 +440,23 @@ function wireEvents() {
   });
   document.getElementById('btn-dial')!.addEventListener('click', () => promptDial());
 
+  // Track whether the user has scrolled away from the
+  // bottom of the message list. We read this flag from
+  // renderMessages() to decide whether to pin a new
+  // message to the bottom or leave the user where they
+  // are reading history. Bound at wire-up time so the
+  // listener survives every innerHTML rewrite.
+  const messagesEl = document.getElementById('messages')!;
+  messagesEl.addEventListener('scroll', () => {
+    state.nearBottom = isNearBottom(messagesEl);
+  });
+
   // Live event streams from the Go side.
   EventsOn('peer:event', (_ev: any) => {
     // Cheap strategy: re-pull the list on every transition.
     // For v0.1 this is fine — peer counts are tiny. Once we
     // hit thousands of peers we'll switch to incremental.
-    refreshAll();
+    refreshAll().then(() => maybeAutoAlias());
   });
 
   EventsOn('message:event', (m: node.Message) => {
@@ -402,6 +476,11 @@ async function bootstrap() {
   mount();
   wireEvents();
   await refreshAll();
+  // First sweep: any peer we already see with a hostname
+  // but no alias gets auto-aliased now, so the sidebar
+  // is friendly from the very first paint instead of
+  // waiting for the next peer:event transition.
+  await maybeAutoAlias();
 }
 
 bootstrap();
