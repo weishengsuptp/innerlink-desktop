@@ -318,14 +318,29 @@ async function selectPeer(peerId: string) {
 async function refreshAll() {
   try {
     const peers = (await ListPeers()) as node.PeerInfo[];
-    state.peers = peers.filter(p => !p.IsSelf);
-    state.selfEntry = peers.find(p => p.IsSelf) ?? null;
     state.selfId = await SelfPeerID();
+    // Filter out self. We do this defensively in two ways:
+    //   1. p.IsSelf (the official flag from core)
+    //   2. p.PeerID === selfId (fallback in case IsSelf
+    //      wasn't set on an early roster merge before the
+    //      channel-registry path caught up).
+    // Without (2), a window's own entry sometimes ends up
+    // in the peer list, which then leaks into the chat
+    // header (header displays self's hostname as if it
+    // were the peer you were talking to).
+    state.peers = peers.filter(p => !p.IsSelf && p.PeerID !== state.selfId);
+    state.selfEntry = peers.find(p => p.IsSelf || p.PeerID === state.selfId) ?? null;
     renderMe();
     renderPeerList();
     renderChatHeader();
     if (state.selectedId) {
-      // Refresh header (online state may have changed).
+      // If the selected peer got filtered out (e.g. it
+      // disconnected and was removed from the roster),
+      // drop the selection so we don't keep showing a
+      // stale conversation.
+      if (!state.peers.find(p => p.PeerID === state.selectedId)) {
+        state.selectedId = null;
+      }
       renderChatHeader();
     }
   } catch (e) {

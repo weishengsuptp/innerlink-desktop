@@ -161,11 +161,14 @@ body {
 
 .messages {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 18px 22px;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  scrollbar-gutter: stable;
 }
 .empty {
   flex: 1;
@@ -179,15 +182,28 @@ body {
 }
 .empty .em-title { font-size: 16px; color: var(--text-2); font-weight: 500; }
 
-.msg { display: flex; flex-direction: column; max-width: 70%; margin: 4px 0; }
-.msg.out { align-self: flex-end; }
-.msg.in { align-self: flex-start; }
+.msg {
+  display: flex;
+  flex-direction: column;
+  /* Cap every bubble at 70% of the panel so a runaway
+   * pasted blob (a 5KB crash dump, say) doesn't push the
+   * composer off-screen. The bubble itself scrolls
+   * internally when the text exceeds max-height. */
+  max-width: min(70%, 560px);
+  margin: 4px 0;
+  min-width: 0;
+}
+.msg.out { align-self: flex-end; align-items: flex-end; }
+.msg.in { align-self: flex-start; align-items: flex-start; }
 .bubble {
   padding: 8px 14px;
   border-radius: 14px;
   font-size: 14px;
   line-height: 1.4;
   word-wrap: break-word;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow-y: auto;
 }
 .msg.out .bubble { background: var(--self-bubble); color: var(--self-text); border-bottom-right-radius: 4px; }
 .msg.in  .bubble { background: var(--peer-bubble); color: var(--peer-text); border-bottom-left-radius: 4px; }
@@ -206,6 +222,7 @@ body {
   display: flex;
   gap: 10px;
   align-items: flex-end;
+  flex-shrink: 0;
 }
 .composer textarea {
   flex: 1;
@@ -230,6 +247,7 @@ body {
   cursor: pointer;
   font-weight: 500;
   font-size: 13px;
+  flex-shrink: 0;
 }
 .composer button:hover { background: #0ea271; }
 .composer button:disabled { background: var(--muted); cursor: not-allowed; }
