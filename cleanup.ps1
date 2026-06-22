@@ -43,6 +43,22 @@ param(
 
 $ErrorActionPreference = 'SilentlyContinue'
 
+# Debug path resolution: $PSScriptRoot is supposed to be
+# the directory containing this script, but PowerShell
+# 5.1 with `-File` invocation has been observed to
+# fall back to the caller's CWD instead. Anchor on
+# $PSCommandPath (the full path of this script, with
+# filename) when we can.
+$scriptPath = $PSCommandPath
+if (-not $scriptPath) {
+    $scriptPath = $PSScriptRoot
+}
+if (-not $scriptPath) {
+    Write-Error "cannot determine script location"
+    exit 1
+}
+Write-Host "==> script at $scriptPath"
+
 function Remove-IfExists($path) {
     if (Test-Path $path) {
         Write-Host "rm $path"
@@ -124,6 +140,36 @@ if ($BuildArtifacts) {
         Write-Host "==> removing $a"
         Remove-IfExists $a
     }
+}
+
+# 6. Rename the running binary out of the way so the
+#    user can drop a new build into the same path
+#    without Windows showing "file in use by another
+#    program". Why this matters: while the binary was
+#    running, Explorer-style paste (CopyFile + Replace)
+#    fails even after we killed the process, because
+#    Windows' file lock on the mapped image lingers
+#    briefly. RenameItem works on the disk path
+#    regardless, so we rotate the path out from under
+#    the lock and the user can paste a fresh binary
+#    into the now-empty slot.
+#
+# Path assembly: anchor on the script's own location
+# (anchored via $PSCommandPath above, fallback to
+# $PSScriptRoot). Split-Path -Parent gives us the
+# directory containing the script (i.e. the repo root).
+$repoRoot = Split-Path -Parent $scriptPath
+$binDir  = Join-Path $repoRoot 'build\bin'
+$bin     = Join-Path $binDir 'innerlink-desktop.exe'
+if (Test-Path $bin) {
+    $i = 1
+    do {
+        $rotated = Join-Path $binDir ("innerlink-desktop.exe.$i.old")
+        $i++
+    } while (Test-Path $rotated)
+    Move-Item -Path $bin -Destination $rotated -Force
+    Write-Host "==> rotated $bin -> $rotated"
+    Write-Host "    paste your new innerlink-desktop.exe into the now-empty slot."
 }
 
 Write-Host ""
