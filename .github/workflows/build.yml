@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+# innerlink-core CI 跑在 3 平台并行；这里把同一套结构搬过来
+# 给 innerlink-desktop 用，但 build 步骤换成 `wails build`。
+# Wails v2 把 frontend/dist 用 embed.FS 嵌进 Go binary，所以
+# CI 不光要 Go，还要 Node + npm + Wails CLI，Linux 还要装
+# webkit2gtk / gtk3 dev headers。
+#
+# 不在 v0.1.4 加 release 任务：现在二进制本地 build 完人肉
+# 测，CI 只做"push 即知能不能编译"的兜底。tag 推送时再补
+# release.yml。
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Build: 3 平台并行 wails build
+  # -------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.5'
+          cache: true
+
+      # Wails v2 把 frontend/dist 通过 embed.FS 嵌进二进制，
+      # 所以 build 前必须能跑 npm install + vite build。
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # pin 到 v2.12.0，跟 go.mod 里 github.com/wailsapp/wails/v2
+      # 一致 —— CLI 和 lib 必须同版本，不然 embedded bindings 容易
+      # 跟 runtime drift。
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      # Linux: webkit2gtk-4.0 + gtk-3 是 Wails 强依赖。
+      # macOS / Windows runner 自带 WebKit / WebView2，不需要装。
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgtk-3-dev libwebkit2gtk-4.0-dev pkg-config
+
+      # Go 静态检查，跟 core CI 对齐。
+      - name: go vet
+        shell: bash
+        run: go vet ./...
+
+      # Wails build 自带：
+      #   1. cd frontend && npm install
+      #   2. cd frontend && npm run build (tsc + vite build)
+      #   3. 编译 Go，把 frontend/dist 嵌进 binary
+      # Windows runner PowerShell 默认会把 ./... 拆坏，强制 bash。
+      - name: wails build
+        shell: bash
+        run: wails build
+
+      # 产物上传，方便 Actions UI 里直接下载做端到端冒烟测。
+      # Windows: build/bin/innerlink-desktop.exe
+      # macOS:   build/bin/innerlink-desktop.app/  (整个 bundle)
+      # Linux:   build/bin/innerlink-desktop       (单文件)
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: innerlink-desktop-${{ matrix.os }}
+          path: |
+            build/bin/innerlink-desktop
+            build/bin/innerlink-desktop.exe
+            build/bin/innerlink-desktop.app/**
+          if-no-files-found: error
