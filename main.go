@@ -106,6 +106,36 @@ func main() {
 	}
 	defer release()
 
+	// On Windows, attach ourselves to a Job Object
+	// with KILL_ON_JOB_CLOSE. This guarantees that
+	// every msedgewebview2.exe child Wails spawns is
+	// terminated by the kernel the moment our process
+	// exits — including hard kills (Stop-Process,
+	// taskkill /F, segfault). The previous approach
+	// (spawning PowerShell from app.beforeClose to
+	// walk the process tree) raced with Wails' own
+	// shutdown and occasionally flashed a PowerShell
+	// console window at the user.
+	//
+	// This MUST run before wails.Run so that the
+	// WebView2 children Wails spawns inherit the job
+	// (children default-inherit their parent's job).
+	// Doing it in OnStartup would be too late — those
+	// children would already exist outside the job.
+	//
+	// On non-Windows platforms initJobObject is a
+	// no-op (see job_other.go). WebKit children die
+	// cleanly with the parent; no job needed.
+	//
+	// Soft-fail: if the OS refuses (we're already
+	// inside another job — e.g. a debugger, a test
+	// harness), log it and keep going. The user can
+	// still rely on cleanup.ps1 as a manual fallback.
+	if err := initJobObject(); err != nil {
+		log.Printf("innerlink-desktop: initJobObject: %v "+
+			"(continuing without auto-cleanup of child processes)", err)
+	}
+
 	app := NewApp()
 
 	err = wails.Run(&options.App{

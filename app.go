@@ -17,13 +17,9 @@ package main
 
 import (
 	"context"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sync"
-	"time"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -89,15 +85,11 @@ func (a *App) startup(ctx context.Context) {
 // window closes; we also rely on the context cancel that
 // Wails propagates here.
 //
-// Wails' WebView2 runtime leaves msedgewebview2.exe
-// children behind on window close. Those children keep
-// file locks on the disk image of innerlink-desktop.exe
-// in build/bin/ for several seconds, which makes a
-// drag-and-drop replacement of the binary fail with
-// "file in use by another program" 鈥?even though the
-// user has already closed the window. We force-kill
-// them here so a normal X close is enough to make the
-// binary replaceable.
+// The msedgewebview2.exe children that Wails spawned are
+// no longer our problem: main.go attached the process to
+// a Windows Job Object with KILL_ON_JOB_CLOSE, so the
+// kernel terminates them the moment we exit. No PowerShell
+// spawn, no WMI walk, no race window.
 func (a *App) shutdown(ctx context.Context) {
 	a.mu.Lock()
 	nd := a.node
@@ -106,24 +98,15 @@ func (a *App) shutdown(ctx context.Context) {
 	if nd != nil {
 		_ = nd.Close()
 	}
-	killWebView2Children()
 }
 
-// beforeClose is Wails' last-chance hook: it runs
+// beforeClose is Wails' last-chance hook. It runs
 // synchronously while the user is still in the close
-// gesture. We use it to give WebView2 a brief grace
-// window to release file handles, then force-kill
-// whatever survived. Returning `prevent: false` lets
-// the close proceed; the kill runs in a goroutine so
-// the close doesn't visibly hang on the user's screen.
+// gesture. Returning `prevent: false` lets the close
+// proceed immediately; we no longer need a grace period
+// because the Job Object guarantees children are reaped
+// on exit.
 func (a *App) beforeClose(ctx context.Context) (prevent bool) {
-	go func() {
-		// Give WebView2 up to ~1.5s to unwind on its
-		// own. Past that, force-kill is needed for
-		// "normal" close behavior on Windows.
-		time.Sleep(1500 * time.Millisecond)
-		killWebView2Children()
-	}()
 	return false
 }
 
@@ -352,51 +335,11 @@ func desktopPaths() (dataDir, logFile, deviceKey, saveDir string) {
 	return
 }
 
-// Compile-time check: the App stays focused on wiring; if
-// we ever add fields that aren't useful to the UI, the
-// compiler will tell us via this unused-import guard.
-var _ = time.Second
-var _ = log.Println
-
-// killWebView2Children force-terminates every
-// msedgewebview2.exe process whose parent is us, plus
-// any whose command line mentions our module path
-// (covers the case where the parent already exited and
-// the child got reparented to PID 0 / services.exe).
-//
-// We don't use the Wails runtime for this 鈥?Wails has
-// no API to kill its own renderer process; the
-// shutdown hooks are advisory. This is the same
-// kill-by-CIM-WMI-lookup trick cleanup.ps1 uses, but
-// in-process so the user doesn't have to remember to
-// run anything after X-ing out the window.
-//
-// On non-Windows this is a no-op (Wails uses WebKit
-// there and there are no WebView2 children to kill).
-func killWebView2Children() {
-	if runtime.GOOS != "windows" {
-		return
-	}
-	// Find our own PID first so the filter can scope to
-	// "children of us" rather than "any webview2 on the
-	// box" (which would be rude on a multi-tenant
-	// machine). CommandLine-based filter is the
-	// fallback for the reparented-child case.
-	ourPID := os.Getpid()
-	ps := `Get-CimInstance Win32_Process -Filter "Name = 'msedgewebview2.exe'" | ` +
-		`Where-Object { $_.ParentProcessId -eq ` + itoa(ourPID) + ` -or $_.CommandLine -like '*innerlink-desktop*' } | ` +
-		`ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps)
-	// Short timeout 鈥?if PowerShell hangs, don't block
-	// our exit forever.
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Run()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		_ = cmd.Process.Kill()
-	}
-}
+// (killWebView2Children used to live here. It spawned
+// PowerShell from a `-H windowsgui` Wails binary, which
+// flashed a console window at the user on every X close,
+// AND raced with Wails' own shutdown so it didn't always
+// find the children in time. Replaced by a Windows Job
+// Object in main.go: see job_windows.go for the new
+// implementation. Same idea (kill the WebView2 children
+// on exit), but kernel-level, race-free, and silent.)
