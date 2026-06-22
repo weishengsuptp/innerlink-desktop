@@ -1,0 +1,45 @@
+# Build artifacts
+/bin/
+/dist/
+/build/
+
+# Wails generated
+/appicon.png
+/windows/
+/mac/
+/linux/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Frontend (node_modules)
+node_modules/
+frontend/dist/
+frontend/node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local data (innerlink runtime)
+/.innerlink/
+innerlink.log
+*.key
+aliases.json
+chat.enc
+roster.json
+scan-history.json
+
+# Mavis scratch
+D:\mavis-tmp/
