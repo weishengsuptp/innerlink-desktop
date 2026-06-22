@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -90,6 +91,27 @@ func (a *App) startup(ctx context.Context) {
 // a Windows Job Object with KILL_ON_JOB_CLOSE, so the
 // kernel terminates them the moment we exit. No PowerShell
 // spawn, no WMI walk, no race window.
+//
+// Belt-and-suspenders exit: Wails v2.12 has a known issue
+// where returning false from OnBeforeClose does NOT cause
+// the main process to actually exit on Windows. The window
+// destroys, but the Go process keeps running headlessly,
+// holding the m_lExecutable section on build/bin/innerlink-
+// desktop.exe and breaking the "X close -> replace binary"
+// workflow. We saw this in practice: a smoke-test innerlink-
+// desktop.exe process kept running with no MainWindowTitle
+// for minutes after the X close, blocking any paste of a
+// new binary into the same slot.
+//
+// To guarantee the process actually exits, we schedule an
+// os.Exit(0) in a goroutine. The 200ms grace lets Wails'
+// own message loop notice the window destruction and
+// fire OnDomReady / OnShutdown; the os.Exit is the
+// nuclear option in case it doesn't.
+//
+// We can't rely on the deferred release() in main() to
+// remove the lockfile once os.Exit fires (os.Exit skips
+// defers), so we remove it here explicitly.
 func (a *App) shutdown(ctx context.Context) {
 	a.mu.Lock()
 	nd := a.node
@@ -98,15 +120,26 @@ func (a *App) shutdown(ctx context.Context) {
 	if nd != nil {
 		_ = nd.Close()
 	}
+	_ = os.Remove(lockPath())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		os.Exit(0)
+	}()
 }
 
 // beforeClose is Wails' last-chance hook. It runs
 // synchronously while the user is still in the close
-// gesture. Returning `prevent: false` lets the close
-// proceed immediately; we no longer need a grace period
-// because the Job Object guarantees children are reaped
-// on exit.
+// gesture.
+//
+// Per Wails docs, returning false ("continue shutdown as
+// normal") should cause the app to exit. In practice on
+// v2.12 + Windows it does not — the window closes but
+// the main process stays alive. We ask Wails to quit
+// explicitly here as a first try, and rely on the
+// os.Exit(0) scheduled in shutdown() as the hard
+// guarantee that the process actually dies.
 func (a *App) beforeClose(ctx context.Context) (prevent bool) {
+	wailsruntime.Quit(ctx)
 	return false
 }
 
