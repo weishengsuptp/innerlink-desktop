@@ -1,46 +1,38 @@
 //go:build windows
 
 // watch the Wails main window and force-exit the process
-// if the user clicks X and Wails' own quit chain wedges.
+// when the user clicks X — regardless of whether Wails'
+// own quit chain runs.
 //
-// v0.1.8 tried to be polite: poll IsWindowVisible every
-// 200ms, sleep 200ms after it goes 0, then TerminateProcess.
-// That worked on the dev VM (where Wails v2.12's main
-// loop happened to be in a state that responded to
-// runtime.Quit), but it did NOT work on the Win10 1909
-// physical box: there, the entire quit chain (OnBeforeClose,
-// runtime.Quit, OnShutdown, pump-cancel) silently failed,
-// the log file went silent the moment the user clicked X,
-// and the process kept the m_lExecutable section on the .exe
-// forever.
+// v0.1.8 polled IsWindowVisible. Failed on the
+// physical box: Wails v2.12 + Win10 1909 doesn't hide
+// OR destroy the window during the X-click handler; the
+// window stays around (visible=1, IsWindow=1) while the
+// process wedges headlessly. Polling never tripped.
 //
-// v0.1.9 first cut used SetWindowSubclass (comctl32 v6).
-// That ALSO broke: on a default Wails build with no app
-// manifest, comctl32 v6 functions aren't exported — Go's
-// syscall.LazyProc panics with "procedure not found" and
-// the watchdog goroutine brings the process down on
-// startup. Backed out.
+// v0.1.9 polled IsWindow. Same problem — Wails leaves
+// the hwnd alive (just shows SW_HIDE), so IsWindow
+// returns 1 forever. v0.1.9 also never tripped.
 //
-// v0.1.9 second cut (this file) uses the simplest possible
-// signal: poll IsWindow(hwnd). When the user clicks X,
-// Wails eventually destroys the window even if it never
-// makes it through its own quit chain. Once IsWindow
-// returns 0, we know the close gesture is in progress.
-// Start a 3s hard-kill timer. If the process is still
-// alive 3s later, TerminateProcess(self, 0). Job Object
-// (job_windows.go) reaps msedgewebview2 children in the
-// same kernel step.
+// v0.1.10: use SetWinEventHook to subscribe to
+// EVENT_OBJECT_HIDE and EVENT_OBJECT_DESTROY. The
+// Accessibility event hook fires whenever the OS
+// reports a window state change — independent of
+// Wails' internal state. If Wails calls
+// ShowWindow(SW_HIDE) (which it does on X click to
+// "soft-close"), EVENT_OBJECT_HIDE fires. If Wails
+// gets far enough to call DestroyWindow, we get
+// EVENT_OBJECT_DESTROY too. Either way we trip.
 //
-// Why 3s: Wails graceful path, when it works, takes
-// ~50-200ms. 3s is 15x that — plenty of headroom for slow
-// disks or busy systems, but well under the time a user
-// would notice a hung close.
+// The hook callback runs on a Windows internal
+// thread. We can't block or call Go runtime from
+// there; we set a uint32 atomically and return.
+// A small goroutine in runWatchdog sees the flag,
+// calls time.AfterFunc(3s, TerminateProcess) once,
+// and exits.
 //
-// Why not IsWindowVisible (v0.1.8): on Win10 1909 the
-// Wails window stayed "visible" (IsWindowVisible=1) for
-// the entire hung session, so the poll never tripped.
-// IsWindow on a destroyed handle is the more reliable
-// signal because the kernel invalidates the handle.
+// Job Object (job_windows.go) reaps msedgewebview2
+// children in the same kernel step.
 
 package main
 
@@ -57,13 +49,15 @@ var (
 
 	wdProcEnumWindows            = modUser32.NewProc("EnumWindows")
 	wdProcGetWindowThreadProcess = modUser32.NewProc("GetWindowThreadProcessId")
-	wdProcIsWindow               = modUser32.NewProc("IsWindow")
 	wdProcGetClassNameW          = modUser32.NewProc("GetClassNameW")
+
+	wdProcSetWinEventHook = modUser32.NewProc("SetWinEventHook")
+	wdProcUnhookWinEvent  = modUser32.NewProc("UnhookWinEvent")
+
+	wdProcGetCurrentThreadId = modKernel32.NewProc("GetCurrentThreadId")
 
 	wdProcTerminateProcess = modKernel32.NewProc("TerminateProcess")
 
-	// -1 is the pseudo-handle for "current process", per
-	// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocess
 	currentProcessPseudoHandle = ^uintptr(0)
 )
 
@@ -71,20 +65,31 @@ const wailsWindowClass = "wailsWindow"
 
 const hardKillTimeout = 3 * time.Second
 
-// hardKillArmed flips to 1 the moment the watchdog
-// detects the close gesture (window destroyed). After
-// that, the hardKillTimer goroutine will TerminateProcess
-// in hardKillTimeout. atomic.Bool would be ideal but
-// works on Go 1.19+; uint32 is universal.
-var hardKillArmed uint32
+// EVENT_OBJECT_HIDE fires when ShowWindow(SW_HIDE) is
+// called on a window. Wails v2.12 uses this on X click.
+// EVENT_OBJECT_DESTROY fires when DestroyWindow is
+// called. We accept either — both mean "user wants to
+// close". The constant values come from
+// <winuser.h> EVENT_OBJECT_HIDE / EVENT_OBJECT_DESTROY.
+const (
+	eventObjectHide    = 0x8003
+	eventObjectDestroy = 0x8007
+)
 
-// armHardKill starts the one-shot TerminateProcess
-// timer. Idempotent — only the first call schedules.
+// closeDetected is flipped to 1 by the event hook
+// callback (running on an OS thread) the moment
+// Hide/Destroy fires on our window. The watchdog
+// goroutine polls this and arms the hard-kill timer
+// on the first transition.
+var closeDetected uint32
+
+// armHardKill is called from runWatchdog once
+// closeDetected flips. Idempotent via CompareAndSwap.
 // TerminateProcess is fire-and-forget at the kernel
 // level: the OS kills us mid-call, the timer goroutine
 // doesn't return.
 func armHardKill() {
-	if !atomic.CompareAndSwapUint32(&hardKillArmed, 0, 1) {
+	if !atomic.CompareAndSwapUint32(&closeDetected, 1, 2) {
 		return
 	}
 	time.AfterFunc(hardKillTimeout, func() {
@@ -142,11 +147,35 @@ func findWailsWindow(ownPID uint32) uintptr {
 	return found
 }
 
-// runWatchdog: locate the Wails window, then poll
-// IsWindow(hwnd) every 200ms. When IsWindow returns 0
-// (the user clicked X and Wails destroyed the window
-// on its way to wedging), arm the hard-kill timer and
-// exit the loop. From there the OS does the rest.
+// eventHookCallback is the SetWinEventHook callback.
+// Runs on a Windows internal thread — we must NOT do
+// any Go runtime calls, blocking I/O, or anything that
+// might be reentrant. Just set the atomic flag and
+// return.
+//
+// Parameters per the WinEventProc signature:
+//   hWinEventHook: the hook handle (we ignore)
+//   event:         the event code (we filter Hide/Destroy)
+//   hwnd:          the window the event is about
+//   idObject, idChild: object/child IDs (we ignore)
+//   idEventThread: the thread that fired the event
+//   dwmsEventTime: timestamp (we ignore)
+func eventHookCallback(
+	hWinEventHook, event, hwnd, idObject, idChild,
+	idEventThread, dwmsEventTime uintptr,
+) uintptr {
+	if event == eventObjectHide || event == eventObjectDestroy {
+		atomic.StoreUint32(&closeDetected, 1)
+	}
+	return 0
+}
+
+// runWatchdog: locate the Wails window, install an
+// event hook scoped to that window, then park on a
+// short poll of closeDetected. The hook callback (on
+// an OS thread) flips closeDetected when Wails hides
+// or destroys the window. We arm the hard-kill timer
+// on the first transition.
 func runWatchdog(ownPID uint32) {
 	// Window may not exist yet at OnStartup. Retry
 	// for up to 10 seconds.
@@ -163,17 +192,43 @@ func runWatchdog(ownPID uint32) {
 		return
 	}
 
-	// Poll IsWindow. Returns nonzero while the
-	// window handle is valid; 0 once it's been
-	// destroyed. Wails v2.12 always destroys the
-	// window on X click (even when its own quit
-	// chain wedges after destroy), so this is the
-	// reliable "user wants to close" signal.
-	ticker := time.NewTicker(200 * time.Millisecond)
+	// Install the event hook. The callback runs on
+	// a Windows-internal thread (NOT the thread that
+	// called SetWinEventHook), so we cannot rely on
+	// any Go runtime state from the callback — only
+	// atomics. The procPtr must be stable for the
+	// hook's lifetime, so we wrap once and reuse.
+	procPtr := syscall.NewCallback(eventHookCallback)
+
+	// Process-wide hooks (0, 0) work for us because
+	// we filter by hwnd in the callback. We could
+	// pass hwnd as the second arg to scope it, but
+	// scoping to a specific hwnd isn't a documented
+	// guarantee and the filter is cheap. Using 0, 0
+	// is the safe path.
+	hook, _, _ := wdProcSetWinEventHook.Call(
+		eventObjectHide,    // eventMin
+		eventObjectDestroy, // eventMax
+		0,                  // hmodWinEventProc (NULL = calling process)
+		procPtr,            // pfnWinEventProc
+		0,                  // idProcess (0 = all)
+		0,                  // idThread  (0 = all)
+		0, // dwFlags (0 = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+	)
+	if hook == 0 {
+		return
+	}
+	defer wdProcUnhookWinEvent.Call(hook)
+
+	// Park here. The event callback flips
+	// closeDetected; we arm the hard-kill timer on
+	// the first 0->1 transition. Poll at 100ms —
+	// fast enough that the user doesn't see delay
+	// between Hide and the kill timer arming.
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
-		stillWindow, _, _ := wdProcIsWindow.Call(hwnd)
-		if stillWindow == 0 {
+		if atomic.LoadUint32(&closeDetected) == 1 {
 			armHardKill()
 			return
 		}
