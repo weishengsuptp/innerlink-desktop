@@ -31,7 +31,16 @@ jobs:
         # webkit2gtk-4.1，Wails 2.12 硬编码 4.0 的 pkg-config
         # 调用直接挂。22.04 jammy 自带 4.0，跟 Wails 2.12 配套。
         # 升级 Wails CLI 到 v2.13+ 之后再回 ubuntu-latest。
-        os: [ubuntu-22.04, windows-latest, macos-latest]
+        #
+        # 不用 macos-latest：GitHub 在 2026-06 把它升到
+        # macOS 26.4 (Tahoe) 了，新 dyld 严格检查 LC_UUID load
+        # command，go install 出来的 wails@v2.12.0 CLI binary
+        # 缺这个 section，Abort trap 6 直接挂。pin 到 macos-14
+        # (Sonoma) 旧的 ARM64 runner，OS 还是 14.x，Go 工具链
+        # 不会升级，Wails CLI 跑得起来。升 Wails 到 v3 (新版
+        # 用 Bazel build 含 LC_UUID) 或者 GitHub 出 macos-15
+        # runner 之前一直 pin macos-14。
+        os: [ubuntu-22.04, windows-latest, macos-14]
     steps:
       - uses: actions/checkout@v4
 
