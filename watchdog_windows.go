@@ -1,102 +1,100 @@
 //go:build windows
 
-// Window-state watchdog for the binary-replace workflow.
+// watch the Wails main window and force-exit the process
+// if the user clicks X and Wails' own quit chain wedges.
 //
-// Why this exists: Wails v2.12 on Windows has a known
-// shutdown synchronization bug. The user's X click does
-// destroy the window, and the WebView2 children do get
-// reaped by the Job Object set up in job_windows.go, but
-// the Go process itself stays alive headlessly because
-// Wails' main message loop is waiting for a "webview
-// complete" event from the Chromium side that arrives
-// asynchronously (and on Win10 1909, often not at all
-// within any reasonable window). OnBeforeClose is
-// sometimes not called, OnShutdown is sometimes not
-// called, runtime.Quit sometimes does nothing, and the Go
-// runtime never reaches its main() return.
+// v0.1.8 tried to be polite: poll IsWindowVisible every
+// 200ms, sleep 200ms after it goes 0, then TerminateProcess.
+// That worked on the dev VM (where Wails v2.12's main
+// loop happened to be in a state that responded to
+// runtime.Quit), but it did NOT work on the Win10 1909
+// physical box: there, the entire quit chain (OnBeforeClose,
+// runtime.Quit, OnShutdown, pump-cancel) silently failed,
+// the log file went silent the moment the user clicked X,
+// and the process kept the m_lExecutable section on the .exe
+// forever.
 //
-// We observed this directly: a smoke-test
-// innerlink-desktop.exe process kept running with no
-// MainWindowTitle for minutes after the X close, blocking
-// any paste of a new binary into build/bin/ because the
-// OS held the m_lExecutable section on the still-running
-// process's own .exe file.
+// v0.1.9 first cut used SetWindowSubclass (comctl32 v6).
+// That ALSO broke: on a default Wails build with no app
+// manifest, comctl32 v6 functions aren't exported — Go's
+// syscall.LazyProc panics with "procedure not found" and
+// the watchdog goroutine brings the process down on
+// startup. Backed out.
 //
-// The fix below sidesteps Wails entirely. We use
-// EnumWindows to find our own top-level window (filtered
-// by pid == our pid), then poll IsWindow on its handle
-// every pollInterval. As soon as IsWindow returns 0
-// (window destroyed for any reason — X click, Alt-F4,
-// End Task, logoff, the screen going to sleep), we give
-// Wails a brief grace period then call kernel32!
-// TerminateProcess on our own pid. TerminateProcess is
-// the most direct possible Windows process kill — the
-// kernel tears us down, no defers, no Wails, no Go
-// runtime can stall it. Job Object reaps any surviving
-// msedgewebview2 children in the same instant.
+// v0.1.9 second cut (this file) uses the simplest possible
+// signal: poll IsWindow(hwnd). When the user clicks X,
+// Wails eventually destroys the window even if it never
+// makes it through its own quit chain. Once IsWindow
+// returns 0, we know the close gesture is in progress.
+// Start a 3s hard-kill timer. If the process is still
+// alive 3s later, TerminateProcess(self, 0). Job Object
+// (job_windows.go) reaps msedgewebview2 children in the
+// same kernel step.
 //
-// On non-Windows this entire file is a no-op (see
-// watchdog_other.go) — WebKit children die cleanly with
-// the parent process on those platforms, and Linux/macOS
-// don't hold the m_lExecutable section lock on the
-// running binary anyway.
+// Why 3s: Wails graceful path, when it works, takes
+// ~50-200ms. 3s is 15x that — plenty of headroom for slow
+// disks or busy systems, but well under the time a user
+// would notice a hung close.
+//
+// Why not IsWindowVisible (v0.1.8): on Win10 1909 the
+// Wails window stayed "visible" (IsWindowVisible=1) for
+// the entire hung session, so the poll never tripped.
+// IsWindow on a destroyed handle is the more reliable
+// signal because the kernel invalidates the handle.
 
 package main
 
 import (
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
 var (
-	// Use a unique package-level namespace so this file
-	// doesn't collide with the same names in
-	// job_windows.go (which also declares kernel32 and
-	// user32). The Go linker would reject two `var
-	// kernel32 = ...` in different files of the same
-	// package.
-	wdKernel32 = syscall.NewLazyDLL("kernel32.dll")
-	wdUser32   = syscall.NewLazyDLL("user32.dll")
+	modUser32   = syscall.NewLazyDLL("user32.dll")
+	modKernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	wdProcEnumWindows          = wdUser32.NewProc("EnumWindows")
-	wdProcGetWindowThreadProcessId = wdUser32.NewProc("GetWindowThreadProcessId")
-	wdProcIsWindow             = wdUser32.NewProc("IsWindow")
-	wdProcIsWindowVisible      = wdUser32.NewProc("IsWindowVisible")
-	wdProcTerminateProcess     = wdKernel32.NewProc("TerminateProcess")
+	wdProcEnumWindows            = modUser32.NewProc("EnumWindows")
+	wdProcGetWindowThreadProcess = modUser32.NewProc("GetWindowThreadProcessId")
+	wdProcIsWindow               = modUser32.NewProc("IsWindow")
+	wdProcGetClassNameW          = modUser32.NewProc("GetClassNameW")
+
+	wdProcTerminateProcess = modKernel32.NewProc("TerminateProcess")
+
+	// -1 is the pseudo-handle for "current process", per
+	// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocess
+	currentProcessPseudoHandle = ^uintptr(0)
 )
 
-// currentProcessPseudoHandle is the special value -1
-// (all bits set) that the Windows kernel interprets as
-// "this process". No need to close it; it isn't a real
-// handle. Same value is returned by GetCurrentProcess()
-// but we don't need to call that — we hardcode the value
-// since it's part of the stable Win32 ABI.
-const currentProcessPseudoHandle = ^uintptr(0)
+const wailsWindowClass = "wailsWindow"
 
-// startWindowWatchdog launches a goroutine that polls our
-// own top-level window handle. When the window is
-// destroyed (X, Alt-F4, End Task, anything that takes the
-// window down), it gives Wails a brief grace period to
-// clean up if it can, then calls TerminateProcess on
-// ourselves. The Job Object (set up in main.go via
-// initJobObject) reaps any surviving WebView2 children
-// at the same instant.
-//
-// This is intentionally a "last resort" — every other
-// shutdown path (OnBeforeClose, runtime.Quit,
-// OnShutdown, os.Exit goroutines) should ideally have
-// killed us first. If we're still here, Wails is wedged
-// and we need to nuke the process from kernel level.
-//
-// ownPID is the pid of the running innerlink-desktop.exe
-// process. The watchdog uses it to filter EnumWindows
-// results to windows that belong to us.
-//
-// Runs forever until the process dies. Safe to call
-// multiple times (each call starts an independent
-// goroutine; the second one is just a duplicate that
-// loses the IsWindow race to the first).
+const hardKillTimeout = 3 * time.Second
+
+// hardKillArmed flips to 1 the moment the watchdog
+// detects the close gesture (window destroyed). After
+// that, the hardKillTimer goroutine will TerminateProcess
+// in hardKillTimeout. atomic.Bool would be ideal but
+// works on Go 1.19+; uint32 is universal.
+var hardKillArmed uint32
+
+// armHardKill starts the one-shot TerminateProcess
+// timer. Idempotent — only the first call schedules.
+// TerminateProcess is fire-and-forget at the kernel
+// level: the OS kills us mid-call, the timer goroutine
+// doesn't return.
+func armHardKill() {
+	if !atomic.CompareAndSwapUint32(&hardKillArmed, 0, 1) {
+		return
+	}
+	time.AfterFunc(hardKillTimeout, func() {
+		wdProcTerminateProcess.Call(currentProcessPseudoHandle, 0)
+	})
+}
+
+// startWindowWatchdog is the public entry point. Called
+// from App.startup on Windows; no-op on other platforms
+// (see watchdog_other.go).
 func startWindowWatchdog(ownPID uint32) {
 	if ownPID == 0 {
 		return
@@ -104,69 +102,58 @@ func startWindowWatchdog(ownPID uint32) {
 	go runWatchdog(ownPID)
 }
 
-// findOwnTopWindow returns the first top-level window
-// whose owning thread process is ownPID, or 0 if no such
-// window exists yet (the Wails window may not be created
-// at the moment OnStartup fires).
-//
-// Filter: pid matches AND IsWindowVisible returns nonzero.
-// The visibility filter matters because EnumWindows also
-// enumerates message-only / owned windows that aren't the
-// user-visible main window. We want the one the user
-// actually clicks X on.
-func findOwnTopWindow(ownPID uint32) uintptr {
+// findWailsWindow enumerates top-level windows owned by
+// ownPID and returns the one whose class is "wailsWindow".
+// Returns 0 if not found yet.
+func findWailsWindow(ownPID uint32) uintptr {
 	var found uintptr
-	// syscall.NewCallback wraps a Go func for use as a
-	// Windows callback. The return value convention is
-	// inverted vs C: returning 0 means "stop the
-	// enumeration", returning nonzero means "continue".
-	// Wails' own EnumWindowsProc convention is the
-	// same: BOOL non-zero = continue, 0 = stop.
 	cb := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
 		var windowPID uint32
-		wdProcGetWindowThreadProcessId.Call(
+		wdProcGetWindowThreadProcess.Call(
 			hwnd,
 			uintptr(unsafe.Pointer(&windowPID)),
 		)
 		if windowPID != ownPID {
-			return 1 // continue
+			return 1
 		}
-		visible, _, _ := wdProcIsWindowVisible.Call(hwnd)
-		if visible == 0 {
-			return 1 // continue — invisible, probably a helper
+		cls := make([]uint16, 256)
+		n, _, _ := wdProcGetClassNameW.Call(
+			hwnd,
+			uintptr(unsafe.Pointer(&cls[0])),
+			uintptr(len(cls)),
+		)
+		if n == 0 {
+			return 1
+		}
+		var s string
+		for i := 0; i < int(n); i++ {
+			if cls[i] == 0 {
+				break
+			}
+			s += string(rune(cls[i]))
+		}
+		if s != wailsWindowClass {
+			return 1
 		}
 		found = hwnd
-		return 0 // stop — found our window
+		return 0
 	})
 	wdProcEnumWindows.Call(cb, 0)
 	return found
 }
 
+// runWatchdog: locate the Wails window, then poll
+// IsWindow(hwnd) every 200ms. When IsWindow returns 0
+// (the user clicked X and Wails destroyed the window
+// on its way to wedging), arm the hard-kill timer and
+// exit the loop. From there the OS does the rest.
 func runWatchdog(ownPID uint32) {
-	const (
-		// pollInterval: how often we re-check
-		// IsWindowVisible. 200ms is fast enough that
-		// a user clicking X and immediately trying to
-		// paste a new binary into build/bin/ won't
-		// see a noticeable delay.
-		pollInterval = 200 * time.Millisecond
-
-		// graceAfterHide: how long to wait after
-		// IsWindowVisible returns 0 (window hidden
-		// because the user clicked X) before
-		// TerminateProcess. Gives Wails' own message
-		// loop a chance to wind down gracefully; if
-		// it does, our TerminateProcess is a no-op.
-		graceAfterHide = 200 * time.Millisecond
-	)
-
-	// First, locate our window. The window may not
-	// be created yet at the moment OnStartup fires,
-	// so retry for up to 5 seconds.
+	// Window may not exist yet at OnStartup. Retry
+	// for up to 10 seconds.
+	deadline := time.Now().Add(10 * time.Second)
 	var hwnd uintptr
-	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		hwnd = findOwnTopWindow(ownPID)
+		hwnd = findWailsWindow(ownPID)
 		if hwnd != 0 {
 			break
 		}
@@ -176,30 +163,18 @@ func runWatchdog(ownPID uint32) {
 		return
 	}
 
-	// Poll IsWindowVisible. When it returns 0, the
-	// user has hidden the window (Wails hides it
-	// via ShowWindow(SW_HIDE) on X click). This is
-	// the last-resort safety net — the graceful
-	// shutdown path (pump-cancel + nd.Close +
-	// Wails runtime.Quit) should normally have
-	// already exited the process by now. If we get
-	// here, Wails v2.12's main loop is wedged and
-	// only a TerminateProcess will get us out.
-	ticker := time.NewTicker(pollInterval)
+	// Poll IsWindow. Returns nonzero while the
+	// window handle is valid; 0 once it's been
+	// destroyed. Wails v2.12 always destroys the
+	// window on X click (even when its own quit
+	// chain wedges after destroy), so this is the
+	// reliable "user wants to close" signal.
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
-		visible, _, _ := wdProcIsWindowVisible.Call(hwnd)
-		if visible == 0 {
-			time.Sleep(graceAfterHide)
-			// TerminateProcess(self, 0). This call
-			// does NOT return — the kernel
-			// terminates us mid-call. Job Object
-			// reaps msedgewebview2 children in the
-			// same atomic step.
-			wdProcTerminateProcess.Call(
-				currentProcessPseudoHandle,
-				0,
-			)
+		stillWindow, _, _ := wdProcIsWindow.Call(hwnd)
+		if stillWindow == 0 {
+			armHardKill()
 			return
 		}
 	}
