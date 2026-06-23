@@ -20,7 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -31,6 +30,17 @@ import (
 // callable from TypeScript via window.go.main.App.Method().
 type App struct {
 	ctx context.Context
+
+	// pumpCancel cancels the long-running pumpPeers /
+	// pumpMessages goroutines on shutdown. Without this,
+	// `for ev := range ch` blocks forever and keeps the
+	// Go runtime alive past main()'s return, which in
+	// turn keeps the process alive past wails.Run()
+	// returning. This was the actual root cause of the
+	// "process stays alive after X close" bug: not a
+	// Wails main-loop hang, but our own pump goroutines
+	// never exiting.
+	pumpCancel context.CancelFunc
 
 	mu   sync.Mutex
 	node *node.Node // nil before Start, after Close
@@ -49,6 +59,33 @@ func NewApp() *App { return &App{} }
 // <cwd>/.innerlink/device.key, just under a stable path).
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	// Start the window-state watchdog. Wails v2.12 on
+	// Windows has a shutdown synchronization bug: the
+	// user's X click does hide the window and the
+	// WebView2 children do get reaped by the Job
+	// Object (set up in main.go), but the Go process
+	// itself stays alive headlessly because Wails'
+	// main message loop is waiting for a "webview
+	// complete" event from Chromium that never arrives.
+	// OnBeforeClose / OnShutdown / runtime.Quit /
+	// os.Exit goroutines all fail to exit the process
+	// in practice.
+	//
+	// The watchdog finds our own top-level window via
+	// EnumWindows (filtered by pid) and polls
+	// IsWindowVisible every 200ms. When the user closes
+	// the window (Wails hides it via ShowWindow(SW_HIDE)
+	// on X click), the watchdog gives Wails 200ms of
+	// grace to clean up if it can, then calls
+	// kernel32!TerminateProcess on our own pid. This
+	// bypasses Wails' main loop entirely; the kernel
+	// tears us down. Job Object reaps surviving
+	// msedgewebview2 children in the same step.
+	//
+	// On non-Windows this is a no-op (see
+	// watchdog_other.go).
+	startWindowWatchdog(uint32(os.Getpid()))
 
 	dataDir, logFile, deviceKey, saveDir := desktopPaths()
 	opts := node.Options{
@@ -73,11 +110,23 @@ func (a *App) startup(ctx context.Context) {
 	a.node = nd
 	a.mu.Unlock()
 
+	// Build a cancellable context for the pump goroutines.
+	// OnShutdown calls a.pumpCancel() so `for ev := range ch`
+	// can fall through to its `<-ctx.Done()` branch and
+	// return. Without this, the pumps block forever on
+	// the channel and the Go runtime keeps the process
+	// alive past wails.Run() returning — this is what
+	// used to leave an orphan innerlink-desktop.exe
+	// process behind after every X close.
+	pumpCtx, pumpCancel := context.WithCancel(context.Background())
+	a.pumpCancel = pumpCancel
+
 	// Pump peer + message streams to the JS side as Wails
-	// events. These run until Close() closes the underlying
-	// channels.
-	go a.pumpPeers(nd)
-	go a.pumpMessages(nd)
+	// events. Both goroutines watch pumpCtx.Done() so
+	// shutdown can break them out of `range ch` even if
+	// the underlying channel hasn't been closed yet.
+	go a.pumpPeers(pumpCtx, nd)
+	go a.pumpMessages(pumpCtx, nd)
 
 	wailsruntime.LogInfof(ctx, "innerlink-desktop: started, peerID=%s", nd.SelfPeerID())
 }
@@ -92,22 +141,11 @@ func (a *App) startup(ctx context.Context) {
 // kernel terminates them the moment we exit. No PowerShell
 // spawn, no WMI walk, no race window.
 //
-// Belt-and-suspenders exit: Wails v2.12 has a known issue
-// where returning false from OnBeforeClose does NOT cause
-// the main process to actually exit on Windows. The window
-// destroys, but the Go process keeps running headlessly,
-// holding the m_lExecutable section on build/bin/innerlink-
-// desktop.exe and breaking the "X close -> replace binary"
-// workflow. We saw this in practice: a smoke-test innerlink-
-// desktop.exe process kept running with no MainWindowTitle
-// for minutes after the X close, blocking any paste of a
-// new binary into the same slot.
-//
-// To guarantee the process actually exits, we schedule an
-// os.Exit(0) in a goroutine. The 200ms grace lets Wails'
-// own message loop notice the window destruction and
-// fire OnDomReady / OnShutdown; the os.Exit is the
-// nuclear option in case it doesn't.
+// On Wails v2.12 + Windows, OnShutdown is sometimes not
+// called at all (the v2.12 main loop is hung waiting for
+// a webview completion signal that never arrives). The
+// os.Exit goroutine here is defense-in-depth for the case
+// where it does get called.
 //
 // We can't rely on the deferred release() in main() to
 // remove the lockfile once os.Exit fires (os.Exit skips
@@ -117,27 +155,45 @@ func (a *App) shutdown(ctx context.Context) {
 	nd := a.node
 	a.node = nil
 	a.mu.Unlock()
+
+	// Cancel the pump goroutines first so they can break
+	// out of `for ev := range ch`. Without this they
+	// would keep the Go runtime alive past main()'s
+	// return, leaving an orphan process holding the
+	// m_lExecutable section on our .exe file.
+	if a.pumpCancel != nil {
+		a.pumpCancel()
+	}
+
+	// Then close the Node. nd.Close() unblocks the
+	// SubscribePeers / SubscribeMessages channels too,
+	// which is what makes the `<-ctx.Done()` branch
+	// inside the pumps actually fire.
 	if nd != nil {
 		_ = nd.Close()
 	}
+
 	_ = os.Remove(lockPath())
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		os.Exit(0)
-	}()
 }
 
 // beforeClose is Wails' last-chance hook. It runs
 // synchronously while the user is still in the close
 // gesture.
 //
-// Per Wails docs, returning false ("continue shutdown as
-// normal") should cause the app to exit. In practice on
-// v2.12 + Windows it does not — the window closes but
-// the main process stays alive. We ask Wails to quit
-// explicitly here as a first try, and rely on the
-// os.Exit(0) scheduled in shutdown() as the hard
-// guarantee that the process actually dies.
+// The real fix for the "process stays alive after X
+// close" bug isn't here — it's in shutdown() and the
+// pump goroutines. This hook just asks Wails to start
+// the shutdown sequence: runtime.Quit posts the quit
+// message, then returning false lets Wails call our
+// shutdown() callback, which cancels the pump context
+// and closes the Node. Once those goroutines exit, main()
+// can return and the process exits cleanly.
+//
+// On v2.12 + Windows the Wails main loop occasionally
+// hangs on the WebView2 async cleanup. In that case the
+// watchdog in watchdog_windows.go detects the hidden
+// window and TerminateProcesses us as a last resort. So
+// this hook is a hint, not a guarantee.
 func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 	wailsruntime.Quit(ctx)
 	return false
@@ -302,19 +358,45 @@ func (a *App) Ping(peerRef string) string {
 // JS side as a Wails "peer:event" with the struct as the
 // event payload. The frontend listens via
 // EventsOn("peer:event", cb).
-func (a *App) pumpPeers(nd *node.Node) {
+//
+// Returns when either:
+//   - the SubscribePeers channel is closed (Node.Close
+//     was called), or
+//   - pumpCtx is cancelled (OnShutdown).
+//
+// Without the pumpCtx branch, `for ev := range ch` would
+// block forever if the channel isn't closed yet, and the
+// Go runtime would keep the process alive past main()'s
+// return — leaving an orphan innerlink-desktop.exe.
+func (a *App) pumpPeers(pumpCtx context.Context, nd *node.Node) {
 	ch := nd.SubscribePeers()
-	for ev := range ch {
-		wailsruntime.EventsEmit(a.ctx, "peer:event", ev)
+	for {
+		select {
+		case <-pumpCtx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			wailsruntime.EventsEmit(a.ctx, "peer:event", ev)
+		}
 	}
 }
 
 // pumpMessages forwards every Message (in or out) to the
 // JS side as "message:event". Same pattern as pumpPeers.
-func (a *App) pumpMessages(nd *node.Node) {
+func (a *App) pumpMessages(pumpCtx context.Context, nd *node.Node) {
 	ch := nd.SubscribeMessages()
-	for m := range ch {
-		wailsruntime.EventsEmit(a.ctx, "message:event", m)
+	for {
+		select {
+		case <-pumpCtx.Done():
+			return
+		case m, ok := <-ch:
+			if !ok {
+				return
+			}
+			wailsruntime.EventsEmit(a.ctx, "message:event", m)
+		}
 	}
 }
 
